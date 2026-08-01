@@ -39,7 +39,6 @@ AVAILABLE_MODELS = [
 AVAILABLE_EFFORTS = ["low", "medium", "high"]
 AVAILABLE_MODES = [("accept-edits", "✏️ Normal (Accept Edits)"), ("plan", "📋 Plan Only")]
 
-# Storage for user sessions
 user_sessions: Dict[int, Dict[str, Any]] = {}
 
 def get_session(user_id: int) -> Dict[str, Any]:
@@ -91,7 +90,8 @@ async def cmd_menu(message: types.Message):
     )
     await message.answer(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
-@dp.message(Command("model"), Command("models"))
+@dp.message(Command("model"))
+@dp.message(Command("models"))
 async def cmd_model(message: types.Message):
     session = get_session(message.from_user.id)
     buttons = []
@@ -199,7 +199,8 @@ async def cb_open_main_menu(callback: types.CallbackQuery):
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
 
-@dp.message(Command("cd"), Command("workspace"))
+@dp.message(Command("cd"))
+@dp.message(Command("workspace"))
 async def cmd_cd(message: types.Message, command: CommandObject):
     session = get_session(message.from_user.id)
     if not command.args:
@@ -253,7 +254,7 @@ async def cmd_help(message: types.Message):
     text = (
         "💡 **Antigravity Telegram Bot Quick Reference**\n\n"
         "• `/menu` - Control Panel & Settings\n"
-        "• `/model` - Switch AI model (Gemini 3.6, Claude, GPT-OSS)\n"
+        "• `/model` - Switch AI model\n"
         "• `/effort` - Set reasoning level (low/medium/high)\n"
         "• `/mode` - Switch mode (accept-edits / plan)\n"
         "• `/cd /path` - Change workspace directory\n"
@@ -283,7 +284,6 @@ async def handle_voice_message(message: types.Message):
     file_info = await bot.get_file(message.voice.file_id)
     await bot.download_file(file_info.file_path, ogg_path)
 
-    # Convert ogg to wav using ffmpeg
     try:
         subprocess.run(["ffmpeg", "-y", "-i", ogg_path, wav_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         audio_file = wav_path
@@ -294,7 +294,8 @@ async def handle_voice_message(message: types.Message):
     message.text = prompt
     await handle_text_prompt(message)
 
-@dp.message(F.text)
+# Text Handler MUST filter out commands (starting with '/')
+@dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text_prompt(message: types.Message):
     user_id = message.from_user.id
     session = get_session(user_id)
