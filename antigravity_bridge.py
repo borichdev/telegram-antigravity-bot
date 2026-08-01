@@ -28,7 +28,10 @@ class AntigravityRunner:
         user_id: int,
         prompt: str,
         conversation_id: Optional[str] = None,
-        workspace_dir: Optional[str] = None
+        workspace_dir: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        mode: Optional[str] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         cmd = [
             config.AGY_PATH,
@@ -40,12 +43,19 @@ class AntigravityRunner:
         if conversation_id:
             cmd.extend(["--conversation", conversation_id])
 
-        if config.DEFAULT_MODEL:
-            cmd.extend(["--model", config.DEFAULT_MODEL])
+        selected_model = model or config.DEFAULT_MODEL
+        if selected_model:
+            cmd.extend(["--model", selected_model])
+
+        if effort:
+            cmd.extend(["--effort", effort])
+
+        if mode:
+            cmd.extend(["--mode", mode])
 
         cwd = workspace_dir or config.WORKSPACE_DIR
 
-        logger.info(f"Executing agy for user {user_id} in {cwd}: {' '.join(cmd)}")
+        logger.info(f"Executing agy for user {user_id} in {cwd} (model={selected_model}, effort={effort}, mode={mode}): {' '.join(cmd)}")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
