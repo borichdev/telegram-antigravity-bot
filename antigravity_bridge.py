@@ -54,7 +54,7 @@ class AntigravityRunner:
         model_suffix_match = re.search(r'-(high|medium|low)$', selected_model) if selected_model else None
         if model_suffix_match:
             cmd.extend(["--effort", model_suffix_match.group(1)])
-        elif effort and selected_model and ("gemini" in selected_model.lower() or "thinking" in selected_model.lower()):
+        elif effort and selected_model and "gemini" in selected_model.lower():
             cmd.extend(["--effort", effort])
 
         if mode:
