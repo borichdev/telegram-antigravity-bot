@@ -349,7 +349,12 @@ async def cb_set_model(callback: types.CallbackQuery):
     session = get_session(user_id)
     old_model = session["model"]
     session["model"] = model_id
-    logger.info(f"[MODEL CHANGE] User {user_id} switched model: {old_model} -> {model_id}")
+
+    suffix_match = re.search(r'-(high|medium|low)$', model_id)
+    if suffix_match:
+        session["effort"] = suffix_match.group(1)
+
+    logger.info(f"[MODEL CHANGE] User {user_id} switched model: {old_model} -> {model_id} (effort={session['effort']})")
     await callback.answer(f"model set to {model_id}")
     await cb_open_model_menu(callback)
 

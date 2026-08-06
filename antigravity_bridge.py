@@ -47,14 +47,14 @@ class AntigravityRunner:
         if selected_model:
             cmd.extend(["--model", selected_model])
 
-        # Only pass --effort if the model supports reasoning effort in agy
-        EFFORT_SUPPORTED_MODELS = {
-            "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low",
-            "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low",
-            "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-opus-4-6-thinking"
-        }
-
-        if effort and selected_model in EFFORT_SUPPORTED_MODELS:
+        # Handle --effort flag correctly based on model name & support:
+        # 1. If model name has suffix (-high, -medium, -low), use matching effort
+        # 2. If model supports reasoning (gemini / thinking) and no suffix, pass effort
+        # 3. Otherwise, omit --effort to avoid conflicts
+        model_suffix_match = re.search(r'-(high|medium|low)$', selected_model) if selected_model else None
+        if model_suffix_match:
+            cmd.extend(["--effort", model_suffix_match.group(1)])
+        elif effort and selected_model and ("gemini" in selected_model.lower() or "thinking" in selected_model.lower()):
             cmd.extend(["--effort", effort])
 
         if mode:
