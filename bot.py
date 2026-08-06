@@ -64,8 +64,8 @@ def get_session(user_id: int) -> Dict[str, Any]:
         user_sessions[user_id] = {
             "conversation_id": None,
             "workspace": config.WORKSPACE_DIR,
-            "model": config.DEFAULT_MODEL or "gemini-3.6-flash-high",
-            "effort": "high",
+            "model": config.DEFAULT_MODEL or "gemini-3.6-flash-medium",
+            "effort": "medium",
             "mode": "accept-edits",
             "sent_message_ids": [],
         }

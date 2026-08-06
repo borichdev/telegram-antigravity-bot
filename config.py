@@ -12,4 +12,4 @@ ALLOWED_USER_IDS = [
 
 AGY_PATH = os.getenv("AGY_PATH", "/home/borichdev/.local/bin/agy")
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/home/borichdev")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.6-flash-medium")
