@@ -692,7 +692,7 @@ async def handle_file_message(message: types.Message):
     await handle_text_prompt(message)
 
 async def main():
-    logger.info("🚀 Starting Antigravity Telegram Bot Gateway (v4.0 - True /resume & /new session restore)...")
+    logger.info("🚀 Starting Antigravity Telegram Bot Gateway (v0.1)...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
