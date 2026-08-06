@@ -123,9 +123,9 @@ def md_to_telegram_html(text: str, is_streaming: bool = False) -> str:
     text = re.sub(r'^(?:&gt;|>)[ \t]?.*(?:\n(?:&gt;|>)[ \t]?.*)*', replace_blockquote, text, flags=re.MULTILINE)
 
     # 7. Convert Headings (#, ##, ###)
-    text = re.sub(r'^[ \t]*# (.*?)$', r'<b>📌 \1</b>\n', text, flags=re.MULTILINE)
-    text = re.sub(r'^[ \t]*## (.*?)$', r'<b>🔹 \1</b>\n', text, flags=re.MULTILINE)
-    text = re.sub(r'^[ \t]*### (.*?)$', r'<b>• \1</b>\n', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*# (.*?)$', r'<b>\1</b>\n', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*## (.*?)$', r'<b>\1</b>\n', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*### (.*?)$', r'<b>\1</b>\n', text, flags=re.MULTILINE)
     text = re.sub(r'^[ \t]*####+ (.*?)$', r'<b>\1</b>\n', text, flags=re.MULTILINE)
 
     # 8. Convert Horizontal Rules (---, ***, ___)
