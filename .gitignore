@@ -1,0 +1,20 @@
+# Environment and secrets
+.env
+*.env
+*.session
+user_session.session
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Application data & logs
+logs/
+downloads/
+
+# IDE
+.idea/
+.vscode/

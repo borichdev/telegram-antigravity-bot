@@ -1,17 +1,21 @@
 import os
+import re
+import json
 import asyncio
 import logging
 import html
 import subprocess
-from typing import Dict, Optional, Any
+from datetime import datetime
+from typing import Dict, Optional, Any, List
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.exceptions import TelegramBadRequest
 
 import config
 from antigravity_bridge import AntigravityRunner
+from telegram_formatter import md_to_telegram_html, split_telegram_html
 
 # Configure dual logging: console + log file
 log_dir = os.path.join(os.path.dirname(__file__), "logs")
@@ -52,6 +56,7 @@ AVAILABLE_MODELS = [
 AVAILABLE_EFFORTS = ["low", "medium", "high"]
 AVAILABLE_MODES = [("accept-edits", "✏️ Normal (Accept Edits)"), ("plan", "📋 Plan Only")]
 
+BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity-cli/brain")
 user_sessions: Dict[int, Dict[str, Any]] = {}
 
 def get_session(user_id: int) -> Dict[str, Any]:
@@ -61,7 +66,8 @@ def get_session(user_id: int) -> Dict[str, Any]:
             "workspace": config.WORKSPACE_DIR,
             "model": config.DEFAULT_MODEL or "gemini-3.6-flash-high",
             "effort": "high",
-            "mode": "accept-edits"
+            "mode": "accept-edits",
+            "sent_message_ids": [],
         }
     return user_sessions[user_id]
 
@@ -69,6 +75,99 @@ def is_allowed(user_id: int) -> bool:
     if not config.ALLOWED_USER_IDS:
         return True
     return user_id in config.ALLOWED_USER_IDS
+
+def get_available_sessions(limit: int = 8) -> List[Dict[str, Any]]:
+    sessions = []
+    if not os.path.exists(BRAIN_DIR):
+        return sessions
+
+    try:
+        dirs = [d for d in os.listdir(BRAIN_DIR) if os.path.isdir(os.path.join(BRAIN_DIR, d))]
+        dirs.sort(key=lambda d: os.path.getmtime(os.path.join(BRAIN_DIR, d)), reverse=True)
+
+        for conv_id in dirs[:limit]:
+            log_file = os.path.join(BRAIN_DIR, conv_id, ".system_generated", "logs", "transcript.jsonl")
+            title = "New / Empty session"
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            data = json.loads(line)
+                            if data.get("type") == "USER_INPUT":
+                                raw = data.get("content", "")
+                                match = re.search(r"<USER_REQUEST>\s*(.*?)\s*(?:</USER_REQUEST>|\n\n\[Telegram|\n<ADDITIONAL)", raw, re.DOTALL)
+                                if match:
+                                    title = match.group(1).strip()
+                                else:
+                                    title = raw[:60].strip()
+                                break
+                except Exception:
+                    pass
+            mtime = os.path.getmtime(os.path.join(BRAIN_DIR, conv_id))
+            dt_str = datetime.fromtimestamp(mtime).strftime("%d.%m %H:%M")
+            sessions.append({
+                "conv_id": conv_id,
+                "title": title[:35] or "Untitled",
+                "mtime_str": dt_str
+            })
+    except Exception as e:
+        logger.error(f"Error scanning brain sessions: {e}")
+
+    return sessions
+
+def extract_session_messages(conv_id: str, max_dialogues: int = 3) -> List[Dict[str, str]]:
+    log_file = os.path.join(BRAIN_DIR, conv_id, ".system_generated", "logs", "transcript.jsonl")
+    if not os.path.exists(log_file):
+        return []
+
+    dialogues = []
+    current_user_text = None
+
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+                stype = data.get("type")
+                source = data.get("source")
+
+                if stype == "USER_INPUT":
+                    raw = data.get("content", "")
+                    match = re.search(r"<USER_REQUEST>\s*(.*?)\s*(?:</USER_REQUEST>|\n\n\[Telegram|\n<ADDITIONAL)", raw, re.DOTALL)
+                    if match:
+                        current_user_text = match.group(1).strip()
+                    else:
+                        clean_raw = re.sub(r"<[^>]+>", "", raw).strip()
+                        current_user_text = clean_raw[:300]
+                elif stype == "PLANNER_RESPONSE" and source == "MODEL":
+                    model_text = data.get("content", "").strip()
+                    if current_user_text and model_text:
+                        dialogues.append({
+                            "user": current_user_text,
+                            "model": model_text
+                        })
+                        current_user_text = None
+    except Exception as e:
+        logger.error(f"Error reading transcript for {conv_id}: {e}")
+
+    return dialogues[-max_dialogues:]
+
+async def track_and_answer(chat_id: int, user_id: int, text: str, parse_mode: Optional[str] = "HTML", reply_markup: Optional[InlineKeyboardMarkup] = None) -> types.Message:
+    sent = await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+    session = get_session(user_id)
+    session["sent_message_ids"].append(sent.message_id)
+    if len(session["sent_message_ids"]) > 50:
+        session["sent_message_ids"] = session["sent_message_ids"][-50:]
+    return sent
+
+async def clear_chat_messages(chat_id: int, user_id: int):
+    session = get_session(user_id)
+    msg_ids = list(session["sent_message_ids"])
+    session["sent_message_ids"] = []
+    for mid in reversed(msg_ids):
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
 
 @dp.message(F.from_user.id.func(lambda uid: not is_allowed(uid)))
 async def handle_unauthorized(message: types.Message):
@@ -83,7 +182,8 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📋 Mode", callback_data="open_mode_menu")
         ],
         [
-            InlineKeyboardButton(text="🔄 New Session", callback_data="menu_new_session"),
+            InlineKeyboardButton(text="📜 Resume Session", callback_data="open_resume_menu"),
+            InlineKeyboardButton(text="✨ New Session", callback_data="menu_new_session"),
             InlineKeyboardButton(text="📊 Status", callback_data="menu_status")
         ]
     ])
@@ -106,15 +206,120 @@ async def cmd_menu(message: types.Message):
     logger.info(f"📥 [COMMAND] User {user_id} issued /menu or /start")
     session = get_session(user_id)
     text = (
-        "👋 **Antigravity AI Control Panel**\n\n"
-        f"🤖 **Model**: `{session['model']}`\n"
-        f"⚙️ **Effort**: `{session['effort']}`\n"
-        f"📋 **Mode**: `{session['mode']}`\n"
-        f"📁 **Workspace**: `{session['workspace']}`\n"
-        f"🆔 **Active Session**: `{session['conversation_id'] or 'New Session'}`\n\n"
-        "Use the buttons below or quick commands to configure:"
+        "👋 <b>Antigravity AI Control Panel</b>\n\n"
+        f"🤖 <b>Model</b>: <code>{session['model']}</code>\n"
+        f"⚙️ <b>Effort</b>: <code>{session['effort']}</code>\n"
+        f"📋 <b>Mode</b>: <code>{session['mode']}</code>\n"
+        f"📁 <b>Workspace</b>: <code>{session['workspace']}</code>\n"
+        f"🆔 <b>Active Session</b>: <code>{session['conversation_id'] or 'New Context'}</code>\n\n"
+        "Quick commands: /resume (select past session), /new (clear chat & new session)"
     )
-    await message.answer(text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
+    await track_and_answer(message.chat.id, user_id, text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+
+@dp.message(Command("resume"))
+@dp.callback_query(F.data == "open_resume_menu")
+async def cmd_resume(event: types.Message | types.CallbackQuery, command: Optional[CommandObject] = None):
+    user_id = event.from_user.id
+    chat_id = event.chat.id if isinstance(event, types.Message) else event.message.chat.id
+    session = get_session(user_id)
+
+    # Check if a specific conv_id was provided as command argument
+    target_conv_id = None
+    if isinstance(event, types.Message) and command and command.args:
+        target_conv_id = command.args.strip()
+
+    if target_conv_id:
+        await activate_and_populate_session(chat_id, user_id, target_conv_id)
+        return
+
+    sessions = get_available_sessions(limit=8)
+    if not sessions:
+        text = "ℹ️ No past sessions found in agy brain storage."
+        if isinstance(event, types.CallbackQuery):
+            await event.answer()
+            await event.message.answer(text)
+        else:
+            await track_and_answer(chat_id, user_id, text)
+        return
+
+    buttons = []
+    for s in sessions:
+        active_mark = "✅ " if session["conversation_id"] == s["conv_id"] else ""
+        btn_text = f"{active_mark}[{s['mtime_str']}] {s['title']}"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"resume_conv:{s['conv_id']}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = "📜 <b>Select a previous session to resume (/resume):</b>"
+
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+        await safe_edit_text(event.message, text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await track_and_answer(chat_id, user_id, text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("resume_conv:"))
+async def cb_resume_conv(callback: types.CallbackQuery):
+    conv_id = callback.data.split("resume_conv:")[1]
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    await callback.answer(f"Resuming session...")
+    await activate_and_populate_session(chat_id, user_id, conv_id)
+
+async def activate_and_populate_session(chat_id: int, user_id: int, conv_id: str):
+    session = get_session(user_id)
+    session["conversation_id"] = conv_id
+
+    # 1. Clear previous bot messages in chat
+    await clear_chat_messages(chat_id, user_id)
+
+    # 2. Extract session dialogues from transcript
+    dialogues = extract_session_messages(conv_id, max_dialogues=3)
+
+    header_text = (
+        f"🔄 <b>Session Resumed</b>: <code>{conv_id}</code>\n"
+        f"───────────────"
+    )
+    await track_and_answer(chat_id, user_id, header_text, parse_mode="HTML")
+
+    if dialogues:
+        for d in dialogues:
+            user_msg = f"💬 <b>User</b>:\n{html.escape(d['user'])}"
+            await track_and_answer(chat_id, user_id, user_msg, parse_mode="HTML")
+
+            model_html = md_to_telegram_html(d['model'])
+            chunks = split_telegram_html(model_html, max_length=4000)
+            for c in chunks:
+                try:
+                    await track_and_answer(chat_id, user_id, c, parse_mode="HTML")
+                except Exception:
+                    await track_and_answer(chat_id, user_id, d['model'][:4000], parse_mode=None)
+
+    footer_text = "✨ <b>Session history restored!</b> You can now continue the conversation."
+    await track_and_answer(chat_id, user_id, footer_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+
+@dp.message(Command("new"))
+@dp.callback_query(F.data == "menu_new_session")
+async def cmd_new(event: types.Message | types.CallbackQuery):
+    user_id = event.from_user.id
+    chat_id = event.chat.id if isinstance(event, types.Message) else event.message.chat.id
+    session = get_session(user_id)
+    old_conv = session["conversation_id"]
+    session["conversation_id"] = None
+
+    logger.info(f"✨ [SESSION RESET] User {user_id} reset conversation (was: {old_conv})")
+
+    # 1. Clear chat messages
+    await clear_chat_messages(chat_id, user_id)
+
+    text = "✨ <b>New session started!</b> Chat cleared and conversation context reset."
+
+    if isinstance(event, types.CallbackQuery):
+        await event.answer("New session started!")
+        await track_and_answer(chat_id, user_id, text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+    else:
+        await track_and_answer(chat_id, user_id, text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
 
 @dp.message(Command("model"))
 @dp.message(Command("models"))
@@ -129,12 +334,11 @@ async def cmd_model(message: types.Message):
     buttons.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(f"🤖 **Select AI Model** (Current: `{session['model']}`):", parse_mode="Markdown", reply_markup=kb)
+    await track_and_answer(message.chat.id, user_id, f"🤖 <b>Select AI Model</b> (Current: <code>{session['model']}</code>):", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "open_model_menu")
 async def cb_open_model_menu(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    logger.info(f"🖱️ [CALLBACK] User {user_id} opened model menu")
     session = get_session(user_id)
     buttons = []
     for model_id, label in AVAILABLE_MODELS:
@@ -143,7 +347,7 @@ async def cb_open_model_menu(callback: types.CallbackQuery):
     buttons.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await safe_edit_text(callback.message, f"🤖 **Select AI Model** (Current: `{session['model']}`):", reply_markup=kb, parse_mode="Markdown")
+    await safe_edit_text(callback.message, f"🤖 <b>Select AI Model</b> (Current: <code>{session['model']}</code>):", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("set_model:"))
 async def cb_set_model(callback: types.CallbackQuery):
@@ -159,7 +363,6 @@ async def cb_set_model(callback: types.CallbackQuery):
 @dp.message(Command("effort"))
 async def cmd_effort(message: types.Message):
     user_id = message.from_user.id
-    logger.info(f"📥 [COMMAND] User {user_id} requested effort menu")
     session = get_session(user_id)
     buttons = []
     for eff in AVAILABLE_EFFORTS:
@@ -168,7 +371,7 @@ async def cmd_effort(message: types.Message):
     buttons_row = [buttons]
     buttons_row.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons_row)
-    await message.answer(f"⚙️ **Select Reasoning Effort** (Current: `{session['effort']}`):", parse_mode="Markdown", reply_markup=kb)
+    await track_and_answer(message.chat.id, user_id, f"⚙️ <b>Select Reasoning Effort</b> (Current: <code>{session['effort']}</code>):", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "open_effort_menu")
 async def cb_open_effort_menu(callback: types.CallbackQuery):
@@ -181,7 +384,7 @@ async def cb_open_effort_menu(callback: types.CallbackQuery):
     buttons_row = [buttons]
     buttons_row.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons_row)
-    await safe_edit_text(callback.message, f"⚙️ **Select Reasoning Effort** (Current: `{session['effort']}`):", reply_markup=kb, parse_mode="Markdown")
+    await safe_edit_text(callback.message, f"⚙️ <b>Select Reasoning Effort</b> (Current: <code>{session['effort']}</code>):", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("set_effort:"))
 async def cb_set_effort(callback: types.CallbackQuery):
@@ -197,7 +400,6 @@ async def cb_set_effort(callback: types.CallbackQuery):
 @dp.message(Command("mode"))
 async def cmd_mode(message: types.Message):
     user_id = message.from_user.id
-    logger.info(f"📥 [COMMAND] User {user_id} requested mode menu")
     session = get_session(user_id)
     buttons = []
     for mode_id, label in AVAILABLE_MODES:
@@ -205,7 +407,7 @@ async def cmd_mode(message: types.Message):
         buttons.append([InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"set_mode:{mode_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(f"📋 **Select Execution Mode** (Current: `{session['mode']}`):", parse_mode="Markdown", reply_markup=kb)
+    await track_and_answer(message.chat.id, user_id, f"📋 <b>Select Execution Mode</b> (Current: <code>{session['mode']}</code>):", parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "open_mode_menu")
 async def cb_open_mode_menu(callback: types.CallbackQuery):
@@ -217,7 +419,7 @@ async def cb_open_mode_menu(callback: types.CallbackQuery):
         buttons.append([InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"set_mode:{mode_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Back to Menu", callback_data="open_main_menu")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await safe_edit_text(callback.message, f"📋 **Select Execution Mode** (Current: `{session['mode']}`):", reply_markup=kb, parse_mode="Markdown")
+    await safe_edit_text(callback.message, f"📋 <b>Select Execution Mode</b> (Current: <code>{session['mode']}</code>):", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("set_mode:"))
 async def cb_set_mode(callback: types.CallbackQuery):
@@ -235,50 +437,35 @@ async def cb_open_main_menu(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     session = get_session(user_id)
     text = (
-        "👋 **Antigravity AI Control Panel**\n\n"
-        f"🤖 **Model**: `{session['model']}`\n"
-        f"⚙️ **Effort**: `{session['effort']}`\n"
-        f"📋 **Mode**: `{session['mode']}`\n"
-        f"📁 **Workspace**: `{session['workspace']}`\n"
-        f"🆔 **Active Session**: `{session['conversation_id'] or 'New Session'}`\n\n"
-        "Use the buttons below or quick commands to configure:"
+        "👋 <b>Antigravity AI Control Panel</b>\n\n"
+        f"🤖 <b>Model</b>: <code>{session['model']}</code>\n"
+        f"⚙️ <b>Effort</b>: <code>{session['effort']}</code>\n"
+        f"📋 <b>Mode</b>: <code>{session['mode']}</code>\n"
+        f"📁 <b>Workspace</b>: <code>{session['workspace']}</code>\n"
+        f"🆔 <b>Active Session</b>: <code>{session['conversation_id'] or 'New Context'}</code>\n\n"
+        "Quick commands: /resume (select past session), /new (clear chat & new session)"
     )
-    await safe_edit_text(callback.message, text, reply_markup=get_main_menu_keyboard(), parse_mode="Markdown")
+    await safe_edit_text(callback.message, text, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
 
 @dp.message(Command("cd"))
 @dp.message(Command("workspace"))
 async def cmd_cd(message: types.Message, command: CommandObject):
     user_id = message.from_user.id
     session = get_session(user_id)
+
     if not command.args:
-        await message.answer(f"📁 Current Workspace: `{session['workspace']}`\nUsage: `/cd /path/to/directory`", parse_mode="Markdown")
+        await track_and_answer(message.chat.id, user_id, f"📁 Current Workspace: <code>{session['workspace']}</code>\nUsage: <code>/cd /path/to/directory</code>", parse_mode="HTML")
         return
 
     new_path = os.path.abspath(command.args.strip())
     if not os.path.exists(new_path) or not os.path.isdir(new_path):
-        logger.warning(f"📁 [WORKSPACE CHANGE FAILED] Directory does not exist: {new_path}")
-        await message.answer(f"❌ Directory does not exist: `{new_path}`", parse_mode="Markdown")
+        await track_and_answer(message.chat.id, user_id, f"❌ Directory does not exist: <code>{new_path}</code>", parse_mode="HTML")
         return
 
     old_ws = session["workspace"]
     session["workspace"] = new_path
     logger.info(f"📁 [WORKSPACE CHANGE] User {user_id} changed workspace: {old_ws} -> {new_path}")
-    await message.answer(f"✅ **Workspace updated to**: `{new_path}`", parse_mode="Markdown")
-
-@dp.message(Command("new"))
-@dp.callback_query(F.data == "menu_new_session")
-async def cmd_new(event: types.Message | types.CallbackQuery):
-    user_id = event.from_user.id
-    session = get_session(user_id)
-    old_conv = session["conversation_id"]
-    session["conversation_id"] = None
-    logger.info(f"🔄 [SESSION RESET] User {user_id} reset conversation session (was: {old_conv})")
-
-    if isinstance(event, types.CallbackQuery):
-        await event.answer("Session reset!")
-        await safe_edit_text(event.message, "🔄 **Session reset!** Starting a new conversation context.", parse_mode="Markdown")
-    else:
-        await event.answer("🔄 **Session reset!** Starting a new conversation context.", parse_mode="Markdown")
+    await track_and_answer(message.chat.id, user_id, f"✅ <b>Workspace updated to</b>: <code>{new_path}</code>", parse_mode="HTML")
 
 @dp.message(Command("status"))
 @dp.callback_query(F.data == "menu_status")
@@ -287,37 +474,39 @@ async def cmd_status(event: types.Message | types.CallbackQuery):
     session = get_session(user_id)
     logger.info(f"📊 [STATUS QUERY] User {user_id} checked status")
     text = (
-        "📊 **Antigravity Status**\n\n"
-        f"👤 **User ID**: `{user_id}`\n"
-        f"🤖 **Model**: `{session['model']}`\n"
-        f"⚙️ **Effort**: `{session['effort']}`\n"
-        f"📋 **Mode**: `{session['mode']}`\n"
-        f"📁 **Workspace**: `{session['workspace']}`\n"
-        f"🆔 **Conversation ID**: `{session['conversation_id'] or 'None (new context)'}`\n"
-        f"⚙️ **AGY Binary**: `{config.AGY_PATH}`\n"
+        "📊 <b>Antigravity Status</b>\n\n"
+        f"👤 <b>User ID</b>: <code>{user_id}</code>\n"
+        f"🤖 <b>Model</b>: <code>{session['model']}</code>\n"
+        f"⚙️ <b>Effort</b>: <code>{session['effort']}</code>\n"
+        f"📋 <b>Mode</b>: <code>{session['mode']}</code>\n"
+        f"📁 <b>Workspace</b>: <code>{session['workspace']}</code>\n"
+        f"🆔 <b>Conversation ID</b>: <code>{session['conversation_id'] or 'None (new context)'}</code>\n"
+        f"⚙️ <b>AGY Binary</b>: <code>{config.AGY_PATH}</code>\n"
     )
+
     if isinstance(event, types.CallbackQuery):
         await event.answer()
-        await event.message.answer(text, parse_mode="Markdown")
+        await safe_edit_text(event.message, text, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
     else:
-        await event.answer(text, parse_mode="Markdown")
+        await track_and_answer(event.chat.id, user_id, text, parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     user_id = message.from_user.id
     logger.info(f"📥 [COMMAND] User {user_id} requested /help")
     text = (
-        "💡 **Antigravity Telegram Bot Quick Reference**\n\n"
-        "• `/menu` - Control Panel & Settings\n"
-        "• `/model` - Switch AI model\n"
-        "• `/effort` - Set reasoning level (low/medium/high)\n"
-        "• `/mode` - Switch mode (accept-edits / plan)\n"
-        "• `/cd /path` - Change workspace directory\n"
-        "• `/new` - Reset conversation history\n"
-        "• `/status` - View current settings\n"
-        "• **Voice Messages** & **Files/Images**: Sent natively to the agent!"
+        "💡 <b>Antigravity Telegram Bot Quick Reference</b>\n\n"
+        "• <code>/resume</code> - Pick & restore previous session history into chat\n"
+        "• <code>/new</code> - Clear chat & start a fresh conversation session\n"
+        "• <code>/menu</code> - Control Panel & Settings\n"
+        "• <code>/model</code> - Switch AI model\n"
+        "• <code>/effort</code> - Set reasoning level (low/medium/high)\n"
+        "• <code>/mode</code> - Switch mode (accept-edits / plan)\n"
+        "• <code>/cd /path</code> - Change workspace directory\n"
+        "• <code>/status</code> - View current settings\n"
+        "• <b>Voice Messages</b> & <b>Files/Images</b>: Sent natively to the agent!"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await track_and_answer(message.chat.id, user_id, text, parse_mode="HTML")
 
 @dp.callback_query(F.data == "stop_execution")
 async def cb_stop(callback: types.CallbackQuery):
@@ -325,7 +514,7 @@ async def cb_stop(callback: types.CallbackQuery):
     logger.info(f"🛑 [EXECUTION STOPPED] User {user_id} clicked Stop Execution")
     await runner.cancel_for_user(user_id)
     await callback.answer("Execution cancelled.")
-    await safe_edit_text(callback.message, "🛑 *Task execution was cancelled by user.*", parse_mode="Markdown")
+    await safe_edit_text(callback.message, "🛑 <b>Task execution was cancelled by user.</b>", parse_mode="HTML")
 
 @dp.message(F.voice)
 async def handle_voice_message(message: types.Message):
@@ -368,16 +557,26 @@ async def handle_text_prompt(message: types.Message):
     stop_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏹ Stop Execution", callback_data="stop_execution")]
     ])
-    
-    status_msg = await message.answer("⚡ *Antigravity initializing...*", parse_mode="Markdown", reply_markup=stop_kb)
+
+    status_msg = await track_and_answer(message.chat.id, user_id, "⚡ <i>Antigravity initializing...</i>", parse_mode="HTML", reply_markup=stop_kb)
 
     full_text = ""
     last_update_time = 0.0
 
+    prompt_with_hint = prompt + (
+        "\n\n[Telegram System Note: Format your response beautifully for Telegram chat.\n"
+        "- Use clean sections with emojis in bold headers (📌, 🔹, 🛠️, 💡, etc.).\n"
+        "- Use short paragraphs and concise bullet points (•).\n"
+        "- Use standard fenced code blocks for any code or bash commands (e.g. ```python ... ```).\n"
+        "- Use blockquotes (`> text`) for quotes, notes, or highlights.\n"
+        "- Avoid markdown tables (use code blocks or bullet lists for tabular data).\n"
+        "- If you generate image files, output their full path on a separate line.]"
+    )
+
     try:
         async for chunk in runner.run_prompt_stream(
             user_id=user_id,
-            prompt=prompt,
+            prompt=prompt_with_hint,
             conversation_id=session.get("conversation_id"),
             workspace_dir=session.get("workspace"),
             model=session.get("model"),
@@ -403,9 +602,13 @@ async def handle_text_prompt(message: types.Message):
                 if now - last_update_time >= 1.2 and full_text:
                     last_update_time = now
                     display_content = full_text
-                    if len(display_content) > 3800:
-                        display_content = "..." + display_content[-3800:]
-                    await safe_edit_text(status_msg, display_content, reply_markup=stop_kb)
+                    if len(display_content) > 3500:
+                        display_content = "..." + display_content[-3500:]
+                    formatted_stream = md_to_telegram_html(display_content)
+                    try:
+                        await safe_edit_text(status_msg, formatted_stream, reply_markup=stop_kb, parse_mode="HTML")
+                    except Exception:
+                        await safe_edit_text(status_msg, display_content, reply_markup=stop_kb, parse_mode=None)
 
             elif event_type == "result":
                 final_res = chunk.get("response", "").strip()
@@ -419,24 +622,44 @@ async def handle_text_prompt(message: types.Message):
             elif event_type == "error":
                 err_text = chunk.get("error", "Unknown error")
                 logger.error(f"❌ [AGY EXECUTION ERROR] {err_text}")
-                full_text += f"\n\n❌ **Error**: {err_text}"
+                full_text += f"\n\n❌ <b>Error</b>: {html.escape(err_text)}"
 
         logger.info(f"📤 [AGENT RESPONSE FINISHED] User {user_id} | Response length: {len(full_text)} chars")
 
         if full_text:
-            if len(full_text) <= 4000:
-                await safe_edit_text(status_msg, full_text, parse_mode="Markdown")
-            else:
-                chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-                await safe_edit_text(status_msg, chunks[0])
-                for c in chunks[1:]:
-                    await message.answer(c)
+            formatted_html = md_to_telegram_html(full_text)
+            chunks = split_telegram_html(formatted_html, max_length=4000)
+
+            try:
+                await safe_edit_text(status_msg, chunks[0], parse_mode="HTML")
+            except Exception as format_err:
+                logger.warning(f"Failed to send HTML formatted response, falling back to plain text: {format_err}")
+                plain_chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
+                await safe_edit_text(status_msg, plain_chunks[0], parse_mode=None)
+
+            for c in chunks[1:]:
+                try:
+                    await track_and_answer(message.chat.id, user_id, c, parse_mode="HTML")
+                except Exception as chunk_err:
+                    logger.warning(f"Failed to send chunk HTML: {chunk_err}")
+                    await track_and_answer(message.chat.id, user_id, c, parse_mode=None)
+
+            # Auto-detect and send image files mentioned in response
+            found_paths = set(re.findall(r'(/[\w\.\-/]+\.(?:png|jpg|jpeg|webp|gif))', full_text, re.IGNORECASE))
+            for img_path in found_paths:
+                if os.path.exists(img_path) and os.path.isfile(img_path):
+                    try:
+                        logger.info(f"📷 [AUTO-SEND IMAGE] Sending image found in response: {img_path}")
+                        img_msg = await bot.send_photo(message.chat.id, FSInputFile(img_path), caption=f"📷 {os.path.basename(img_path)}")
+                        session["sent_message_ids"].append(img_msg.message_id)
+                    except Exception as img_err:
+                        logger.error(f"Failed to auto-send image {img_path}: {img_err}")
         else:
-            await safe_edit_text(status_msg, "✅ *Done (no text output)*", parse_mode="Markdown")
+            await safe_edit_text(status_msg, "✅ <i>Done (no text output)</i>", parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"❌ [UNHANDLED ERROR] Exception during prompt handling: {e}", exc_info=True)
-        await safe_edit_text(status_msg, f"❌ *An unexpected error occurred*: `{html.escape(str(e))}`", parse_mode="Markdown")
+        await safe_edit_text(status_msg, f"❌ <i>An unexpected error occurred</i>: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 @dp.message(F.document | F.photo)
 async def handle_file_message(message: types.Message):
@@ -469,7 +692,7 @@ async def handle_file_message(message: types.Message):
     await handle_text_prompt(message)
 
 async def main():
-    logger.info("🚀 Starting Antigravity Telegram Bot Gateway with Full Audit Logging...")
+    logger.info("🚀 Starting Antigravity Telegram Bot Gateway (v4.0 - True /resume & /new session restore)...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
