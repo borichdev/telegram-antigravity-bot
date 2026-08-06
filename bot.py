@@ -47,10 +47,12 @@ runner = AntigravityRunner()
 AVAILABLE_MODELS = [
     ("gemini-3.6-flash-high", "⚡ Gemini 3.6 Flash (High)"),
     ("gemini-3.6-flash-medium", "⚡ Gemini 3.6 Flash (Med)"),
+    ("gemini-3.6-flash-low", "⚡ Gemini 3.6 Flash (Low)"),
     ("gemini-3.1-pro-high", "🧠 Gemini 3.1 Pro (High)"),
+    ("gemini-3.1-pro-low", "🧠 Gemini 3.1 Pro (Low)"),
     ("claude-sonnet-4-6", "🎭 Claude Sonnet 4.6"),
     ("claude-opus-4-6-thinking", "🔥 Claude Opus 4.6 (Thinking)"),
-    ("gpt-oss-120b-medium", "🤖 GPT-OSS 120B"),
+    ("gpt-oss-120b-medium", "🤖 GPT-OSS 120B (Medium)"),
 ]
 
 AVAILABLE_EFFORTS = ["low", "medium", "high"]

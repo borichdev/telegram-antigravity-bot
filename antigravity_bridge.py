@@ -47,7 +47,14 @@ class AntigravityRunner:
         if selected_model:
             cmd.extend(["--model", selected_model])
 
-        if effort:
+        # Only pass --effort if the model supports reasoning effort in agy
+        EFFORT_SUPPORTED_MODELS = {
+            "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low",
+            "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low",
+            "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-opus-4-6-thinking"
+        }
+
+        if effort and selected_model in EFFORT_SUPPORTED_MODELS:
             cmd.extend(["--effort", effort])
 
         if mode:
@@ -105,12 +112,20 @@ class AntigravityRunner:
                         current_conv_id = res.get("conversation_id", current_conv_id)
                         final_response = res.get("response", "")
                         status = res.get("status", "SUCCESS")
-                        yield {
-                            "type": "result",
-                            "conversation_id": current_conv_id,
-                            "response": final_response,
-                            "status": status
-                        }
+                        err_msg = res.get("error", "")
+
+                        if status == "ERROR" and err_msg:
+                            yield {
+                                "type": "error",
+                                "error": err_msg
+                            }
+                        else:
+                            yield {
+                                "type": "result",
+                                "conversation_id": current_conv_id,
+                                "response": final_response,
+                                "status": status
+                            }
                 except json.JSONDecodeError:
                     logger.warning(f"Raw non-JSON output from agy: {line_str}")
                     yield {
